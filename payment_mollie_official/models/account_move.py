@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-from odoo import models, fields, _
-from odoo.exceptions import UserError
+from mollie.api.client import Client
+from odoo import models, fields
 
 import logging
 
@@ -10,91 +10,88 @@ _logger = logging.getLogger(__name__)
 class AccountMove(models.Model):
     _inherit = "account.move"
 
-    valid_for_mollie_refund = fields.Boolean(compute="_compute_valid_for_mollie_refund")
-    mollie_refund_reference = fields.Char()
+    _mollie_client = Client()
 
-    def _get_mollie_payment_data_for_refund(self):
-        self.ensure_one()
-        mollie_transactions = self._find_valid_mollie_transactions()
-        if self.type == 'out_refund' and mollie_transactions:
-            # TODO: Need to handle multiple transection
-            if len(mollie_transactions) > 1:
-                raise UserError(_("Multiple mollie transactions are linked with invoice. Please refund manually from mollie portal"))
-            payment_record = mollie_transactions.acquirer_id._mollie_get_payment_data(mollie_transactions.acquirer_reference, force_payment=True)
-            return payment_record, mollie_transactions
-        return False, mollie_transactions
+    is_mollie_refund = fields.Boolean(compute="_compute_is_mollie_refund")
 
-    def _compute_valid_for_mollie_refund(self):
+    # check the reversed invoice is payment done by mollie
+    def _compute_is_mollie_refund(self):
         for move in self:
-            has_mollie_tx = False
-            if move.type == 'out_refund' and move._find_valid_mollie_transactions() and move.state == "posted":
-                has_mollie_tx = True
-            move.valid_for_mollie_refund = has_mollie_tx
+            if (
+                move.type != "out_refund"
+                or move.state != "posted"
+                or move.invoice_payment_state == "paid"
+            ):
+                move.is_mollie_refund = False
+                continue
 
-    def mollie_process_refund(self):
+            provider = (
+                self.env["payment.acquirer"].sudo()._get_main_mollie_provider()
+            )
+            key = provider._get_mollie_api_keys(provider.state)[
+                "mollie_api_key"
+            ]
+            self._mollie_client.set_api_key(key)
+
+            if not move.reversed_entry_id.transaction_ids:
+                transaction_ids = (
+                    self.env["payment.transaction"]
+                    .sudo()
+                    .search([("invoice_ids", "in", move.reversed_entry_id.id)])
+                )
+            else:
+                transaction_ids = move.reversed_entry_id.transaction_ids
+
+            reference = transaction_ids.filtered(
+                lambda t: t.acquirer_id.provider == "mollie"
+            ).mapped("acquirer_reference")
+
+            if isinstance(reference and reference[0], bool) or reference == []:
+                move.is_mollie_refund = False
+                continue
+
+            payment = self._mollie_client.payments.get(reference[0])
+            if payment.get("_links").get("refunds"):
+                move.is_mollie_refund = False
+                continue
+
+            move.is_mollie_refund = "mollie" in transaction_ids[
+                0
+            ].acquirer_id.mapped("provider")
+
+    # create mollie refund order payment
+    def mollie_refund_orders_create(self):
         self.ensure_one()
-        payment_record, mollie_transactions = self._get_mollie_payment_data_for_refund()
-        if payment_record:
-            # Create payment record and post the payment
-            AccountPayment = self.env['account.payment'].with_context(active_ids=self.ids, active_model='account.move', active_id=self.id)
-            payment_obj = AccountPayment.create({
-                'journal_id': mollie_transactions.payment_id.journal_id.id,
-                'payment_method_id': mollie_transactions.payment_id.payment_method_id.id
-            })
-            payment_obj.post()
+        provider = (
+            self.env["payment.acquirer"].sudo()._get_main_mollie_provider()
+        )
+        key = provider._get_mollie_api_keys(provider.state)["mollie_api_key"]
+        self._mollie_client.set_api_key(key)
 
-            # Create refund in mollie via API
-            refund = mollie_transactions.acquirer_id._api_mollie_refund(self.amount_total, self.currency_id, payment_record)
-            if refund['status'] == 'refunded':
-                self.mollie_refund_reference = refund['id']
+        if not self.reversed_entry_id.transaction_ids:
+            transaction_ids = (
+                self.env["payment.transaction"]
+                .sudo()
+                .search([("invoice_ids", "in", self.reversed_entry_id.id)])
+            )
+        else:
+            transaction_ids = self.reversed_entry_id.transaction_ids
 
-    def _find_valid_mollie_transactions(self):
-        self.ensure_one()
+        reference = transaction_ids.mapped("acquirer_reference")
+        if isinstance(reference and reference[0], bool):
+            return
 
-        # CASE 1: For the credit notes generated from invoice
-        transections = self.reversed_entry_id.transaction_ids.filtered(lambda tx: tx.state == 'done' and tx.acquirer_id.provider == 'mollie')
-
-        # CASE 2: For the credit note generated due to returns of delivery
-        # TODO: In this case credit note is generated from Sale order and so both invoice are not linked as reversal move.
-        # this module does not have direct dependencies on the sales module. We are checking fields in move line to check sale order is linked.
-        # and we get transections info from sale order. May be, we can create glue module for this.
-        if not transections and 'sale_line_ids' in  self.invoice_line_ids._fields:
-            transections = self.invoice_line_ids.mapped('sale_line_ids.order_id.transaction_ids')
-
-        return transections
-
-    def post(self):
-        """ Vouchers might create extra payment record for reminder amount
-            when 2 diffrent journal are there 2 payment records are created
-            so we need to process second payment if present.
-        """
-
-        res = super(AccountMove, self).post()
-
-        for invoice in self.filtered(lambda move: move.is_invoice()):
-            payments = invoice.mapped('transaction_ids.mollie_reminder_payment_id')
-            move_lines = payments.mapped('move_line_ids').filtered(lambda line: not line.reconciled and line.credit > 0.0)
-            for line in move_lines:
-                invoice.js_assign_outstanding_line(line.id)
-        return res
-
-    def action_invoice_register_refund_payment(self):
-        result = self.action_invoice_register_payment()
-        payment_record, mollie_transactions = self._get_mollie_payment_data_for_refund()
-
-        # We will not get `amountRemaining` key if payment is not paid (only authorized)
-        if payment_record and payment_record.get('amountRemaining'):
-            # TO-DO: check the case where amount is refunded in another currency or raise warning
-            remaining_amount = float(payment_record['amountRemaining']['value'])
-            if remaining_amount:
-                context = {
-                    'default_journal_id': mollie_transactions.payment_id.journal_id.id,
-                    'default_payment_method_id': mollie_transactions.payment_id.payment_method_id.id,
-                    'default_amount': min(self.amount_residual, remaining_amount),
-                    'default_is_mollie_refund': True,
-                    'default_max_mollie_amount': remaining_amount,
-                    'default_mollie_transecion_id': mollie_transactions.id
+        try:
+            payment = self._mollie_client.payments.get(reference[0])
+            self._mollie_client.payment_refunds.on(payment).create(
+                {
+                    "amount": {
+                        "value": "%.2f" % self.amount_total,
+                        "currency": self.currency_id.name,
+                    }
                 }
-                context.update(result['context'])
-                result['context'] = context
-        return result
+            )
+            self.invoice_payment_state = "paid"
+            self.message_post(body="Mollie payment refund has been generated.")
+        except Exception as e:
+            _logger.warning(e)
